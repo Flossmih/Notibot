@@ -3,7 +3,7 @@ import logging
 import threading
 from datetime import datetime, timedelta
 from flask import Flask
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, CallbackQueryHandler,
     MessageHandler, filters, ContextTypes
@@ -37,7 +37,8 @@ def init_db():
         user_id INTEGER,
         category TEXT,
         title TEXT,
-        description TEXT
+        description TEXT,
+        done INTEGER DEFAULT 0
     )''')
     c.execute('''CREATE TABLE IF NOT EXISTS reminders (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -65,10 +66,30 @@ def add_note(user_id, category, title, description):
 def get_notes(user_id):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("SELECT id, category, title, description FROM notes WHERE user_id = ? ORDER BY id", (user_id,))
+    c.execute("SELECT id, category, title, description, done FROM notes WHERE user_id = ? ORDER BY id", (user_id,))
     rows = c.fetchall()
     conn.close()
     return rows
+
+def search_notes(user_id, query):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT id, category, title, description, done FROM notes WHERE user_id = ? AND (title LIKE ? OR description LIKE ?) ORDER BY id",
+              (user_id, f"%{query}%", f"%{query}%"))
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+def toggle_note_done(note_id, user_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT done FROM notes WHERE id = ? AND user_id = ?", (note_id, user_id))
+    row = c.fetchone()
+    if row:
+        new_done = 0 if row[0] else 1
+        c.execute("UPDATE notes SET done = ? WHERE id = ? AND user_id = ?", (new_done, note_id, user_id))
+        conn.commit()
+    conn.close()
 
 def delete_note(note_id, user_id):
     conn = sqlite3.connect(DB_PATH)
@@ -125,9 +146,11 @@ def main_menu():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📝 Добавить заметку", callback_data="add_note")],
         [InlineKeyboardButton("📋 Мои заметки", callback_data="list_notes")],
+        [InlineKeyboardButton("🔍 Поиск", callback_data="search_notes")],
         [InlineKeyboardButton("⏰ Добавить напоминание", callback_data="add_reminder")],
         [InlineKeyboardButton("🔔 Мои напоминания", callback_data="list_reminders")],
-        [InlineKeyboardButton("🗑 Удалить заметку", callback_data="delete_note")]
+        [InlineKeyboardButton("🗑 Удалить заметку", callback_data="delete_note")],
+        [InlineKeyboardButton("📤 Экспорт заметок", callback_data="export_notes")]
     ])
 
 def back_button():
@@ -171,10 +194,7 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif data == "add_note":
-        await query.edit_message_text(
-            "📁 Выбери категорию для заметки:",
-            reply_markup=category_menu()
-        )
+        await query.edit_message_text("📁 Выбери категорию для заметки:", reply_markup=category_menu())
 
     elif data.startswith("cat_"):
         category = data.replace("cat_", "")
@@ -190,12 +210,29 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("📋 У тебя пока нет заметок.", reply_markup=back_button())
         else:
             text = "📋 Твои заметки:\n\n"
-            for note_id, category, title, description in notes:
-                text += f"{note_id}. [{category}] {title}\n"
+            for note_id, category, title, description, done in notes:
+                status = "✅" if done else "⬜"
+                text += f"{status} {note_id}. [{category}] {title}\n"
                 if description:
                     text += f"   └ {description}\n"
                 text += "\n"
-            await query.edit_message_text(text, reply_markup=back_button())
+            text += "Нажми на номер заметки, чтобы отметить её выполненной:"
+            # Кнопки для отметки
+            buttons = []
+            for note_id, category, title, description, done in notes:
+                status = "✅" if done else "⬜"
+                buttons.append([InlineKeyboardButton(f"{status} {note_id}. {title[:20]}", callback_data=f"toggle_{note_id}")])
+            buttons.append([InlineKeyboardButton("⬅️ Назад в меню", callback_data="back_to_menu")])
+            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+
+    elif data.startswith("toggle_"):
+        note_id = int(data.replace("toggle_", ""))
+        toggle_note_done(note_id, user_id)
+        await menu_callback(update, context)  # Обновляем список
+
+    elif data == "search_notes":
+        user_states[user_id] = "waiting_search"
+        await query.edit_message_text("🔍 Напиши слово для поиска:", reply_markup=back_button())
 
     elif data == "add_reminder":
         user_states[user_id] = "waiting_reminder_text"
@@ -207,15 +244,42 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("🔔 У тебя пока нет напоминаний.", reply_markup=back_button())
         else:
             text = "🔔 Твои напоминания:\n\n"
+            buttons = []
             for rem_id, rem_text, remind_at, repeat_daily, hour, minute in reminders:
                 dt = datetime.fromisoformat(remind_at)
                 repeat = "🔁 каждый день" if repeat_daily else "🔂 один раз"
                 text += f"{rem_id}. {rem_text}\n   └ {dt.strftime('%d.%m %H:%M')} ({repeat})\n\n"
-            await query.edit_message_text(text, reply_markup=back_button())
+                buttons.append([InlineKeyboardButton(f"🗑 Удалить {rem_id}", callback_data=f"delrem_{rem_id}")])
+            buttons.append([InlineKeyboardButton("⬅️ Назад в меню", callback_data="back_to_menu")])
+            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+
+    elif data.startswith("delrem_"):
+        rem_id = int(data.replace("delrem_", ""))
+        delete_reminder(rem_id)
+        await query.edit_message_text("✅ Напоминание удалено.", reply_markup=back_button())
 
     elif data == "delete_note":
         user_states[user_id] = "waiting_delete_id"
         await query.edit_message_text("🗑 Напиши номер заметки, которую удалить:", reply_markup=back_button())
+
+    elif data == "export_notes":
+        notes = get_notes(user_id)
+        if not notes:
+            await query.edit_message_text("📋 У тебя нет заметок для экспорта.", reply_markup=back_button())
+            return
+        text = "📋 Мои заметки (экспорт)\n"
+        text += f"Дата: {datetime.now().strftime('%d.%m.%Y %H:%M')}\n\n"
+        for note_id, category, title, description, done in notes:
+            status = "✅" if done else "⬜"
+            text += f"{status} [{category}] {title}\n"
+            if description:
+                text += f"   {description}\n"
+            text += "\n"
+        # Отправляем как файл
+        with open("export.txt", "w", encoding="utf-8") as f:
+            f.write(text)
+        await query.message.reply_document(document=open("export.txt", "rb"), filename="notes_export.txt")
+        await query.edit_message_text("📤 Экспорт готов!", reply_markup=back_button())
 
 async def repeat_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -283,6 +347,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_states.pop(user_id, None)
         await update.message.reply_text("✅ Заметка добавлена!", reply_markup=back_button())
 
+    # === Поиск ===
+    elif state == "waiting_search":
+        notes = search_notes(user_id, text)
+        user_states.pop(user_id, None)
+        if not notes:
+            await update.message.reply_text("🔍 Ничего не найдено.", reply_markup=back_button())
+        else:
+            result = f"🔍 Найдено {len(notes)} заметок:\n\n"
+            for note_id, category, title, description, done in notes:
+                status = "✅" if done else "⬜"
+                result += f"{status} {note_id}. [{category}] {title}\n"
+                if description:
+                    result += f"   └ {description}\n"
+                result += "\n"
+            await update.message.reply_text(result, reply_markup=back_button())
+
     # === Текст напоминания ===
     elif state == "waiting_reminder_text":
         user_states[user_id] = {"state": "waiting_reminder_time", "text": text}
@@ -298,10 +378,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "hour": hour,
                 "minute": minute
             }
-            await update.message.reply_text(
-                "🔁 Повторять напоминание?",
-                reply_markup=repeat_menu()
-            )
+            await update.message.reply_text("🔁 Повторять напоминание?", reply_markup=repeat_menu())
         except:
             await update.message.reply_text("❌ Неверный формат. Напиши как 18:30.")
 
@@ -322,7 +399,6 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
         try:
             await context.bot.send_message(user_id, f"⏰ Напоминание:\n\n{text}")
             if repeat_daily:
-                # Пересчитываем на следующий день
                 now = datetime.now()
                 next_time = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
                 if next_time <= now:

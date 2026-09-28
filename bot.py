@@ -43,13 +43,17 @@ def init_db():
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER,
         text TEXT,
-        remind_at TEXT
+        remind_at TEXT,
+        repeat_daily INTEGER DEFAULT 0,
+        hour INTEGER,
+        minute INTEGER
     )''')
     conn.commit()
     conn.close()
 
 init_db()
 
+# --- Заметки ---
 def add_note(user_id, category, title, description):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -58,13 +62,10 @@ def add_note(user_id, category, title, description):
     conn.commit()
     conn.close()
 
-def get_notes(user_id, category=None):
+def get_notes(user_id):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    if category:
-        c.execute("SELECT id, category, title, description FROM notes WHERE user_id = ? AND category = ? ORDER BY id", (user_id, category))
-    else:
-        c.execute("SELECT id, category, title, description FROM notes WHERE user_id = ? ORDER BY id", (user_id,))
+    c.execute("SELECT id, category, title, description FROM notes WHERE user_id = ? ORDER BY id", (user_id,))
     rows = c.fetchall()
     conn.close()
     return rows
@@ -76,19 +77,28 @@ def delete_note(note_id, user_id):
     conn.commit()
     conn.close()
 
-def add_reminder(user_id, text, remind_at):
+# --- Напоминания ---
+def add_reminder(user_id, text, remind_at, repeat_daily, hour, minute):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("INSERT INTO reminders (user_id, text, remind_at) VALUES (?, ?, ?)",
-              (user_id, text, remind_at.isoformat()))
+    c.execute("INSERT INTO reminders (user_id, text, remind_at, repeat_daily, hour, minute) VALUES (?, ?, ?, ?, ?, ?)",
+              (user_id, text, remind_at.isoformat(), repeat_daily, hour, minute))
     conn.commit()
     conn.close()
+
+def get_reminders(user_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT id, text, remind_at, repeat_daily, hour, minute FROM reminders WHERE user_id = ? ORDER BY id", (user_id,))
+    rows = c.fetchall()
+    conn.close()
+    return rows
 
 def get_due_reminders():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     now = datetime.now().isoformat()
-    c.execute("SELECT id, user_id, text FROM reminders WHERE remind_at <= ?", (now,))
+    c.execute("SELECT id, user_id, text, repeat_daily, hour, minute FROM reminders WHERE remind_at <= ?", (now,))
     rows = c.fetchall()
     conn.close()
     return rows
@@ -100,6 +110,13 @@ def delete_reminder(reminder_id):
     conn.commit()
     conn.close()
 
+def update_reminder_time(reminder_id, new_time):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("UPDATE reminders SET remind_at = ? WHERE id = ?", (new_time.isoformat(), reminder_id))
+    conn.commit()
+    conn.close()
+
 # ========== СОСТОЯНИЯ ==========
 user_states = {}
 
@@ -108,7 +125,8 @@ def main_menu():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📝 Добавить заметку", callback_data="add_note")],
         [InlineKeyboardButton("📋 Мои заметки", callback_data="list_notes")],
-        [InlineKeyboardButton("⏰ Напоминание", callback_data="add_reminder")],
+        [InlineKeyboardButton("⏰ Добавить напоминание", callback_data="add_reminder")],
+        [InlineKeyboardButton("🔔 Мои напоминания", callback_data="list_reminders")],
         [InlineKeyboardButton("🗑 Удалить заметку", callback_data="delete_note")]
     ])
 
@@ -123,6 +141,13 @@ def category_menu():
         [InlineKeyboardButton("🏠 Личное", callback_data="cat_Личное")],
         [InlineKeyboardButton("🛒 Покупки", callback_data="cat_Покупки")],
         [InlineKeyboardButton("💡 Идеи", callback_data="cat_Идеи")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="back_to_menu")]
+    ])
+
+def repeat_menu():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔂 Один раз", callback_data="repeat_no")],
+        [InlineKeyboardButton("🔁 Каждый день", callback_data="repeat_daily")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="back_to_menu")]
     ])
 
@@ -176,9 +201,58 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_states[user_id] = "waiting_reminder_text"
         await query.edit_message_text("⏰ Напиши текст напоминания:", reply_markup=back_button())
 
+    elif data == "list_reminders":
+        reminders = get_reminders(user_id)
+        if not reminders:
+            await query.edit_message_text("🔔 У тебя пока нет напоминаний.", reply_markup=back_button())
+        else:
+            text = "🔔 Твои напоминания:\n\n"
+            for rem_id, rem_text, remind_at, repeat_daily, hour, minute in reminders:
+                dt = datetime.fromisoformat(remind_at)
+                repeat = "🔁 каждый день" if repeat_daily else "🔂 один раз"
+                text += f"{rem_id}. {rem_text}\n   └ {dt.strftime('%d.%m %H:%M')} ({repeat})\n\n"
+            await query.edit_message_text(text, reply_markup=back_button())
+
     elif data == "delete_note":
         user_states[user_id] = "waiting_delete_id"
         await query.edit_message_text("🗑 Напиши номер заметки, которую удалить:", reply_markup=back_button())
+
+async def repeat_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    state = user_states.get(user_id)
+
+    if not isinstance(state, dict) or state.get("state") != "waiting_repeat":
+        return
+
+    repeat_daily = 1 if query.data == "repeat_daily" else 0
+    hour = state["hour"]
+    minute = state["minute"]
+
+    now = datetime.now()
+    remind_at = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if remind_at <= now:
+        remind_at += timedelta(days=1)
+
+    add_reminder(user_id, state["text"], remind_at, repeat_daily, hour, minute)
+    user_states.pop(user_id, None)
+
+    repeat_text = "каждый день" if repeat_daily else "один раз"
+    await query.edit_message_text(
+        f"✅ Напоминание установлено на {remind_at.strftime('%H:%M')} ({repeat_text})",
+        reply_markup=back_button()
+    )
+
+async def skip_description(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    state = user_states.get(user_id)
+    if isinstance(state, dict) and state.get("state") == "waiting_description":
+        add_note(user_id, state["category"], state["title"], "")
+        user_states.pop(user_id, None)
+        await query.edit_message_text("✅ Заметка добавлена без описания!", reply_markup=back_button())
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -209,23 +283,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_states.pop(user_id, None)
         await update.message.reply_text("✅ Заметка добавлена!", reply_markup=back_button())
 
-    # === Напоминание ===
+    # === Текст напоминания ===
     elif state == "waiting_reminder_text":
         user_states[user_id] = {"state": "waiting_reminder_time", "text": text}
         await update.message.reply_text("🕐 Теперь напиши время в формате 18:30 (ЧЧ:ММ).", reply_markup=back_button())
 
+    # === Время напоминания ===
     elif isinstance(state, dict) and state.get("state") == "waiting_reminder_time":
         try:
             hour, minute = map(int, text.split(":"))
-            now = datetime.now()
-            remind_at = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-            if remind_at <= now:
-                remind_at += timedelta(days=1)
-            add_reminder(user_id, state["text"], remind_at)
-            user_states.pop(user_id, None)
+            user_states[user_id] = {
+                "state": "waiting_repeat",
+                "text": state["text"],
+                "hour": hour,
+                "minute": minute
+            }
             await update.message.reply_text(
-                f"✅ Напоминание установлено на {remind_at.strftime('%d.%m %H:%M')}",
-                reply_markup=back_button()
+                "🔁 Повторять напоминание?",
+                reply_markup=repeat_menu()
             )
         except:
             await update.message.reply_text("❌ Неверный формат. Напиши как 18:30.")
@@ -240,23 +315,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except:
             await update.message.reply_text("❌ Напиши номер заметки (число).")
 
-async def skip_description(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user_id = query.from_user.id
-    state = user_states.get(user_id)
-    if isinstance(state, dict) and state.get("state") == "waiting_description":
-        add_note(user_id, state["category"], state["title"], "")
-        user_states.pop(user_id, None)
-        await query.edit_message_text("✅ Заметка добавлена без описания!", reply_markup=back_button())
-
 # ========== НАПОМИНАНИЯ ==========
 async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
     due = get_due_reminders()
-    for reminder_id, user_id, text in due:
+    for reminder_id, user_id, text, repeat_daily, hour, minute in due:
         try:
             await context.bot.send_message(user_id, f"⏰ Напоминание:\n\n{text}")
-            delete_reminder(reminder_id)
+            if repeat_daily:
+                # Пересчитываем на следующий день
+                now = datetime.now()
+                next_time = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+                if next_time <= now:
+                    next_time += timedelta(days=1)
+                update_reminder_time(reminder_id, next_time)
+            else:
+                delete_reminder(reminder_id)
         except Exception as e:
             logging.error(f"Reminder error: {e}")
 
@@ -267,6 +340,7 @@ if __name__ == '__main__':
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(skip_description, pattern="^skip_description$"))
+    app.add_handler(CallbackQueryHandler(repeat_choice, pattern="^repeat_"))
     app.add_handler(CallbackQueryHandler(menu_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.job_queue.run_repeating(check_reminders, interval=30, first=10)

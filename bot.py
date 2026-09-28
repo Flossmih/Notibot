@@ -1,6 +1,8 @@
 import os
 import logging
+import threading
 from datetime import datetime, timedelta
+from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, CallbackQueryHandler,
@@ -11,6 +13,18 @@ import sqlite3
 # ========== КОНФИГ ==========
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
+
+# ========== ВЕБ-СЕРВЕР ДЛЯ RENDER ==========
+web_app = Flask(__name__)
+
+@web_app.route('/')
+@web_app.route('/health')
+def health():
+    return "Bot is running"
+
+def run_flask():
+    port = int(os.environ.get("PORT", 10000))
+    web_app.run(host='0.0.0.0', port=port, use_reloader=False)
 
 # ========== БАЗА ДАННЫХ ==========
 DB_PATH = "notes.db"
@@ -181,6 +195,8 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
 
 # ========== ЗАПУСК ==========
 if __name__ == '__main__':
+    threading.Thread(target=run_flask, daemon=True).start()
+    
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(menu_callback))

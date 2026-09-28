@@ -1,9 +1,9 @@
 import os
 import logging
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from flask import Flask
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, CallbackQueryHandler,
     MessageHandler, filters, ContextTypes
@@ -13,6 +13,13 @@ import sqlite3
 # ========== КОНФИГ ==========
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
+
+# ========== ЧАСОВОЙ ПОЯС (МСК = UTC+3) ==========
+MSK = timezone(timedelta(hours=3))
+
+def now_msk():
+    """Возвращает текущее время по МСК (naive, без tzinfo)."""
+    return datetime.now(MSK).replace(tzinfo=None)
 
 # ========== ВЕБ-СЕРВЕР ==========
 web_app = Flask(__name__)
@@ -116,9 +123,10 @@ def get_reminders(user_id):
     return rows
 
 def get_due_reminders():
+    """Возвращает напоминания, время которых пришло (по МСК)."""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    now = datetime.now().isoformat()
+    now = now_msk().isoformat()
     c.execute("SELECT id, user_id, text, repeat_daily, hour, minute FROM reminders WHERE remind_at <= ?", (now,))
     rows = c.fetchall()
     conn.close()
@@ -177,7 +185,8 @@ def repeat_menu():
 # ========== КОМАНДЫ ==========
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 Привет! Я бот для заметок и напоминаний.\n\nВыбери действие:",
+        "👋 Привет! Я бот для заметок и напоминаний.\n"
+        "🕐 Время указывается по МСК.\n\nВыбери действие:",
         reply_markup=main_menu()
     )
 
@@ -210,25 +219,21 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("📋 У тебя пока нет заметок.", reply_markup=back_button())
         else:
             text = "📋 Твои заметки:\n\n"
+            buttons = []
             for note_id, category, title, description, done in notes:
                 status = "✅" if done else "⬜"
                 text += f"{status} {note_id}. [{category}] {title}\n"
                 if description:
                     text += f"   └ {description}\n"
                 text += "\n"
-            text += "Нажми на номер заметки, чтобы отметить её выполненной:"
-            # Кнопки для отметки
-            buttons = []
-            for note_id, category, title, description, done in notes:
-                status = "✅" if done else "⬜"
-                buttons.append([InlineKeyboardButton(f"{status} {note_id}. {title[:20]}", callback_data=f"toggle_{note_id}")])
+                buttons.append([InlineKeyboardButton(f"{status} {note_id}. {title[:25]}", callback_data=f"toggle_{note_id}")])
             buttons.append([InlineKeyboardButton("⬅️ Назад в меню", callback_data="back_to_menu")])
             await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
 
     elif data.startswith("toggle_"):
         note_id = int(data.replace("toggle_", ""))
         toggle_note_done(note_id, user_id)
-        await menu_callback(update, context)  # Обновляем список
+        await menu_callback(update, context)
 
     elif data == "search_notes":
         user_states[user_id] = "waiting_search"
@@ -268,14 +273,13 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("📋 У тебя нет заметок для экспорта.", reply_markup=back_button())
             return
         text = "📋 Мои заметки (экспорт)\n"
-        text += f"Дата: {datetime.now().strftime('%d.%m.%Y %H:%M')}\n\n"
+        text += f"Дата: {now_msk().strftime('%d.%m.%Y %H:%M')} (МСК)\n\n"
         for note_id, category, title, description, done in notes:
             status = "✅" if done else "⬜"
             text += f"{status} [{category}] {title}\n"
             if description:
                 text += f"   {description}\n"
             text += "\n"
-        # Отправляем как файл
         with open("export.txt", "w", encoding="utf-8") as f:
             f.write(text)
         await query.message.reply_document(document=open("export.txt", "rb"), filename="notes_export.txt")
@@ -294,7 +298,7 @@ async def repeat_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     hour = state["hour"]
     minute = state["minute"]
 
-    now = datetime.now()
+    now = now_msk()
     remind_at = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
     if remind_at <= now:
         remind_at += timedelta(days=1)
@@ -304,7 +308,7 @@ async def repeat_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     repeat_text = "каждый день" if repeat_daily else "один раз"
     await query.edit_message_text(
-        f"✅ Напоминание установлено на {remind_at.strftime('%H:%M')} ({repeat_text})",
+        f"✅ Напоминание установлено на {remind_at.strftime('%H:%M')} МСК ({repeat_text})",
         reply_markup=back_button()
     )
 
@@ -366,12 +370,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # === Текст напоминания ===
     elif state == "waiting_reminder_text":
         user_states[user_id] = {"state": "waiting_reminder_time", "text": text}
-        await update.message.reply_text("🕐 Теперь напиши время в формате 18:30 (ЧЧ:ММ).", reply_markup=back_button())
+        await update.message.reply_text(
+            "🕐 Теперь напиши время в формате 18:30 (ЧЧ:ММ) по МСК.",
+            reply_markup=back_button()
+        )
 
     # === Время напоминания ===
     elif isinstance(state, dict) and state.get("state") == "waiting_reminder_time":
         try:
             hour, minute = map(int, text.split(":"))
+            if not (0 <= hour < 24 and 0 <= minute < 60):
+                raise ValueError
             user_states[user_id] = {
                 "state": "waiting_repeat",
                 "text": state["text"],
@@ -394,12 +403,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ========== НАПОМИНАНИЯ ==========
 async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
+    """Проверяет напоминания и отправляет их. Работает по МСК."""
     due = get_due_reminders()
     for reminder_id, user_id, text, repeat_daily, hour, minute in due:
         try:
             await context.bot.send_message(user_id, f"⏰ Напоминание:\n\n{text}")
             if repeat_daily:
-                now = datetime.now()
+                now = now_msk()
                 next_time = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
                 if next_time <= now:
                     next_time += timedelta(days=1)
@@ -421,5 +431,5 @@ if __name__ == '__main__':
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.job_queue.run_repeating(check_reminders, interval=30, first=10)
 
-    logging.info("Bot started...")
+    logging.info("Bot started... (MSK timezone)")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
